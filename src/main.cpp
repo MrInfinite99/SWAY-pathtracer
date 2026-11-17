@@ -1,20 +1,18 @@
-#include <vulkan/vulkan_raii.hpp>
+#include "app.h"
 
 #include <cstdio>
+#include <exception>
 
 int main()
 {
-    uint32_t apiVersion = 0;
-    VkResult result = vkEnumerateInstanceVersion(&apiVersion);
-    if (result != VK_SUCCESS) {
-        std::printf("vkEnumerateInstanceVersion failed: %d\n", result);
+    try {
+        App app(800, 600);
+        app.run();
+    }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "fatal: %s\n", e.what());
         return 1;
     }
-
-    std::printf("Vulkan instance version: %u.%u.%u\n",
-                VK_API_VERSION_MAJOR(apiVersion),
-                VK_API_VERSION_MINOR(apiVersion),
-                VK_API_VERSION_PATCH(apiVersion));
 
     return 0;
 }

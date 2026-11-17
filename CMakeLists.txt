@@ -18,3 +18,10 @@ target_link_libraries(sway PRIVATE
     glm::glm
     GPUOpen::VulkanMemoryAllocator
 )
+
+# Strips the constructors from vk:: structs so they are aggregates, which is
+# what C++20 designated initializers require. Must apply to every translation
+# unit: defining it in some but not others is an ODR violation.
+target_compile_definitions(sway PRIVATE
+    VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
+)
