@@ -1,0 +1,15 @@
+{
+  "name": "sway",
+  "version": "0.1.0",
+  "builtin-baseline": "0df93a05b9de080129e653ec4776d7e14a1b2e4f",
+  "dependencies": [
+    "vk-bootstrap",
+    "glfw3",
+    "glm",
+    "vulkan-memory-allocator"
+  ],
+  "overrides": [
+    { "name": "vk-bootstrap", "version": "1.4.335" },
+    { "name": "vulkan-headers", "version": "1.4.335.0" }
+  ]
+}
