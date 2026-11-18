@@ -84,10 +84,14 @@ public:
 		return *this;
 	}
 
-	void pollEvents() {
-		while (!glfwWindowShouldClose(window)) {
-			glfwPollEvents();
-		}
+	// Single-shot now: the loop lives in App, because its body needs the
+	// device, swapchain and queue.
+	void pollEvents() const {
+		glfwPollEvents();
+	}
+
+	bool shouldClose() const {
+		return glfwWindowShouldClose(window) == GLFW_TRUE;
 	}
 
 	GLFWwindow* get() const noexcept {
@@ -516,6 +520,190 @@ public:
 	vk::Extent2D getExtent() const noexcept { return extent; }
 };
 
+// One frame: wait for this frame's fence, acquire an image, clear it, present.
+// No pipeline is involved - the clear is a transfer operation, and the only
+// real work is moving the image between layouts.
+class Renderer {
+private:
+	static constexpr std::size_t MAX_FRAMES_IN_FLIGHT = 2;
+
+	const Device& device;
+	const Swapchain& swapchain;
+
+	vk::raii::CommandPool pool{ nullptr };
+	std::vector<vk::raii::CommandBuffer> commandBuffers;
+
+	// Per frame in flight: these are waited on before the frame is reused.
+	std::vector<vk::raii::Semaphore> imageAvailable;
+	std::vector<vk::raii::Fence> inFlight;
+
+	// Per swapchain image, not per frame: presentation waits on this, and
+	// which image we get back from acquire is the driver's choice.
+	std::vector<vk::raii::Semaphore> renderFinished;
+
+	std::size_t frame = 0;
+
+	static constexpr vk::ImageSubresourceRange COLOR_RANGE{
+		.aspectMask = vk::ImageAspectFlagBits::eColor,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1,
+	};
+
+	void record(const vk::raii::CommandBuffer& cmd, vk::Image image) const {
+		cmd.reset();
+		cmd.begin(vk::CommandBufferBeginInfo{
+			.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+		});
+
+		const vk::ImageMemoryBarrier2 toTransferDst{
+			.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+			.srcAccessMask = {},
+			.dstStageMask = vk::PipelineStageFlagBits2::eClear,
+			.dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+			// Undefined: we overwrite every pixel, so the old contents are
+			// not worth preserving.
+			.oldLayout = vk::ImageLayout::eUndefined,
+			.newLayout = vk::ImageLayout::eTransferDstOptimal,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = image,
+			.subresourceRange = COLOR_RANGE,
+		};
+
+		cmd.pipelineBarrier2(vk::DependencyInfo{
+			.imageMemoryBarrierCount = 1,
+			.pImageMemoryBarriers = &toTransferDst,
+		});
+
+		const vk::ClearColorValue clearColor{ 0.10f, 0.10f, 0.16f, 1.0f };
+		cmd.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, clearColor, COLOR_RANGE);
+
+		const vk::ImageMemoryBarrier2 toPresent{
+			.srcStageMask = vk::PipelineStageFlagBits2::eClear,
+			.srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+			.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+			.dstAccessMask = {},
+			.oldLayout = vk::ImageLayout::eTransferDstOptimal,
+			.newLayout = vk::ImageLayout::ePresentSrcKHR,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = image,
+			.subresourceRange = COLOR_RANGE,
+		};
+
+		cmd.pipelineBarrier2(vk::DependencyInfo{
+			.imageMemoryBarrierCount = 1,
+			.pImageMemoryBarriers = &toPresent,
+		});
+
+		cmd.end();
+	}
+
+public:
+	Renderer(const Device& dev, const Swapchain& swap) :device(dev), swapchain(swap) {
+		pool = vk::raii::CommandPool{ device.get(), vk::CommandPoolCreateInfo{
+			.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+			.queueFamilyIndex = device.getQueueFamily(),
+		} };
+
+		commandBuffers = vk::raii::CommandBuffers{ device.get(), vk::CommandBufferAllocateInfo{
+			.commandPool = *pool,
+			.level = vk::CommandBufferLevel::ePrimary,
+			.commandBufferCount = static_cast<std::uint32_t>(MAX_FRAMES_IN_FLIGHT),
+		} };
+
+		for (std::size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+			imageAvailable.emplace_back(device.get(), vk::SemaphoreCreateInfo{});
+
+			// Created signalled, so the first wait on it returns at once.
+			inFlight.emplace_back(device.get(), vk::FenceCreateInfo{
+				.flags = vk::FenceCreateFlagBits::eSignaled,
+			});
+		}
+
+		for (std::size_t i = 0; i < swapchain.getImages().size(); ++i) {
+			renderFinished.emplace_back(device.get(), vk::SemaphoreCreateInfo{});
+		}
+	}
+
+	Renderer(const Renderer&) = delete;
+	Renderer& operator=(const Renderer&) = delete;
+	Renderer(Renderer&&) = delete;
+	Renderer& operator=(Renderer&&) = delete;
+
+	void drawFrame() {
+		const vk::raii::Fence& fence = inFlight[frame];
+
+		while (device.get().waitForFences(*fence, vk::True, UINT64_MAX) == vk::Result::eTimeout) {
+		}
+
+		std::uint32_t imageIndex = 0;
+
+		try {
+			// raii reports out-of-date by throwing, not by a result code.
+			const auto [result, index] = swapchain.get().acquireNextImage(UINT64_MAX, *imageAvailable[frame]);
+			static_cast<void>(result);
+			imageIndex = index;
+		}
+		catch (const vk::OutOfDateKHRError&) {
+			return;
+		}
+
+		// Reset only once we know we are going to submit, or a skipped frame
+		// leaves the fence unsignalled and the next wait hangs forever.
+		device.get().resetFences(*fence);
+
+		record(commandBuffers[frame], swapchain.getImages()[imageIndex]);
+
+		const vk::SemaphoreSubmitInfo waitInfo{
+			.semaphore = *imageAvailable[frame],
+			.value = 0,
+			.stageMask = vk::PipelineStageFlagBits2::eClear,
+			.deviceIndex = 0,
+		};
+
+		const vk::CommandBufferSubmitInfo commandInfo{
+			.commandBuffer = *commandBuffers[frame],
+			.deviceMask = 0,
+		};
+
+		const vk::SemaphoreSubmitInfo signalInfo{
+			.semaphore = *renderFinished[imageIndex],
+			.value = 0,
+			.stageMask = vk::PipelineStageFlagBits2::eAllCommands,
+			.deviceIndex = 0,
+		};
+
+		device.getQueue().submit2(vk::SubmitInfo2{
+			.waitSemaphoreInfoCount = 1,
+			.pWaitSemaphoreInfos = &waitInfo,
+			.commandBufferInfoCount = 1,
+			.pCommandBufferInfos = &commandInfo,
+			.signalSemaphoreInfoCount = 1,
+			.pSignalSemaphoreInfos = &signalInfo,
+		}, *fence);
+
+		const vk::Semaphore waitOn = *renderFinished[imageIndex];
+		const vk::SwapchainKHR handle = *swapchain.get();
+
+		try {
+			static_cast<void>(device.getQueue().presentKHR(vk::PresentInfoKHR{
+				.waitSemaphoreCount = 1,
+				.pWaitSemaphores = &waitOn,
+				.swapchainCount = 1,
+				.pSwapchains = &handle,
+				.pImageIndices = &imageIndex,
+			}));
+		}
+		catch (const vk::OutOfDateKHRError&) {
+		}
+
+		frame = (frame + 1) % MAX_FRAMES_IN_FLIGHT;
+	}
+};
+
 class App {
 private:
 
@@ -530,12 +718,15 @@ private:
 	Device device;
 	// Last: destroyed first, before both the device and the surface.
 	Swapchain swapchain;
+	// After the swapchain: its semaphores are sized from the image count.
+	Renderer renderer;
 public:
 	App(std::uint32_t w, std::uint32_t h)
 		:window(w, h),
 		surface(instance, window),
 		device(instance),
-		swapchain(device, surface, window) {
+		swapchain(device, surface, window),
+		renderer(device, swapchain) {
 
 	}
 
@@ -547,7 +738,14 @@ public:
 	~App() = default;
 
 	void run() {
-		window.pollEvents();
+		while (!window.shouldClose()) {
+			window.pollEvents();
+			renderer.drawFrame();
+		}
+
+		// Nothing may be in flight when the members below start destroying
+		// semaphores, fences and command buffers.
+		device.get().waitIdle();
 	}
 
 	 
