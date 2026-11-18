@@ -3,6 +3,8 @@
 
 #include<vulkan/vulkan_raii.hpp>
 
+#include"alloc.h"
+
 #define GLFW_INCLUDE_VULKAN
 #include<GLFW/glfw3.h>
 #include<array>
@@ -10,6 +12,7 @@
 #include<cstdio>
 #include<cstring>
 #include<algorithm>
+#include<fstream>
 #include<optional>
 #include<stdexcept>
 #include<vector>
@@ -520,6 +523,173 @@ public:
 	vk::Extent2D getExtent() const noexcept { return extent; }
 };
 
+inline std::vector<std::uint32_t> readSpirv(const char* path) {
+	std::ifstream file(path, std::ios::ate | std::ios::binary);
+	if (!file) {
+		throw std::runtime_error(std::string{ "cannot open " } + path);
+	}
+
+	const std::streamsize bytes = file.tellg();
+	if (bytes <= 0 || bytes % 4 != 0) {
+		throw std::runtime_error(std::string{ "not valid SPIR-V: " } + path);
+	}
+
+	// Read into uint32_t, not char: pCode wants 4-byte-aligned words.
+	std::vector<std::uint32_t> code(static_cast<std::size_t>(bytes) / 4);
+	file.seekg(0);
+	file.read(reinterpret_cast<char*>(code.data()), bytes);
+
+	return code;
+}
+
+// The image the renderer actually draws into. Float, because accumulation
+// from Phase 6 on needs more precision than the swapchain's 8-bit UNORM, and
+// storage-image usage on swapchain images is not reliably supported anyway.
+class StorageImage {
+public:
+	static constexpr vk::Format FORMAT = vk::Format::eR32G32B32A32Sfloat;
+
+private:
+	AllocatedImage image;
+	vk::raii::ImageView view{ nullptr };
+	vk::Extent2D extent{};
+
+public:
+	StorageImage(const Device& device, const Allocator& allocator, vk::Extent2D size)
+		:extent(size) {
+
+		image = AllocatedImage{ allocator, vk::ImageCreateInfo{
+			.imageType = vk::ImageType::e2D,
+			.format = FORMAT,
+			.extent = vk::Extent3D{ size.width, size.height, 1 },
+			.mipLevels = 1,
+			.arrayLayers = 1,
+			.samples = vk::SampleCountFlagBits::e1,
+			.tiling = vk::ImageTiling::eOptimal,
+			.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+			.sharingMode = vk::SharingMode::eExclusive,
+			.initialLayout = vk::ImageLayout::eUndefined,
+		} };
+
+		view = vk::raii::ImageView{ device.get(), vk::ImageViewCreateInfo{
+			.image = image.get(),
+			.viewType = vk::ImageViewType::e2D,
+			.format = FORMAT,
+			.subresourceRange = vk::ImageSubresourceRange{
+				.aspectMask = vk::ImageAspectFlagBits::eColor,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		} };
+	}
+
+	StorageImage(const StorageImage&) = delete;
+	StorageImage& operator=(const StorageImage&) = delete;
+	StorageImage(StorageImage&&) = delete;
+	StorageImage& operator=(StorageImage&&) = delete;
+
+	vk::Image get() const noexcept { return image.get(); }
+	const vk::raii::ImageView& getView() const noexcept { return view; }
+	vk::Extent2D getExtent() const noexcept { return extent; }
+};
+
+// Throwaway, deleted at Phase 4. It exists so that when ray tracing renders
+// black, the image path is already known to work.
+class GradientPipeline {
+private:
+	vk::raii::DescriptorSetLayout setLayout{ nullptr };
+	vk::raii::DescriptorPool descriptorPool{ nullptr };
+	std::vector<vk::raii::DescriptorSet> sets;
+	vk::raii::PipelineLayout pipelineLayout{ nullptr };
+	vk::raii::Pipeline pipeline{ nullptr };
+
+public:
+	GradientPipeline(const Device& device, const StorageImage& target) {
+		const vk::DescriptorSetLayoutBinding binding{
+			.binding = 0,
+			.descriptorType = vk::DescriptorType::eStorageImage,
+			.descriptorCount = 1,
+			.stageFlags = vk::ShaderStageFlagBits::eCompute,
+		};
+
+		setLayout = vk::raii::DescriptorSetLayout{ device.get(), vk::DescriptorSetLayoutCreateInfo{
+			.bindingCount = 1,
+			.pBindings = &binding,
+		} };
+
+		const vk::DescriptorPoolSize poolSize{
+			.type = vk::DescriptorType::eStorageImage,
+			.descriptorCount = 1,
+		};
+
+		descriptorPool = vk::raii::DescriptorPool{ device.get(), vk::DescriptorPoolCreateInfo{
+			// raii frees the set in its destructor, which the pool must allow.
+			.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+			.maxSets = 1,
+			.poolSizeCount = 1,
+			.pPoolSizes = &poolSize,
+		} };
+
+		const vk::DescriptorSetLayout rawLayout = *setLayout;
+
+		sets = vk::raii::DescriptorSets{ device.get(), vk::DescriptorSetAllocateInfo{
+			.descriptorPool = *descriptorPool,
+			.descriptorSetCount = 1,
+			.pSetLayouts = &rawLayout,
+		} };
+
+		const vk::DescriptorImageInfo imageInfo{
+			.imageView = *target.getView(),
+			// Storage images are written in eGeneral; there is no
+			// "optimal for writing" layout for them.
+			.imageLayout = vk::ImageLayout::eGeneral,
+		};
+
+		device.get().updateDescriptorSets(vk::WriteDescriptorSet{
+			.dstSet = *sets.front(),
+			.dstBinding = 0,
+			.dstArrayElement = 0,
+			.descriptorCount = 1,
+			.descriptorType = vk::DescriptorType::eStorageImage,
+			.pImageInfo = &imageInfo,
+		}, nullptr);
+
+		pipelineLayout = vk::raii::PipelineLayout{ device.get(), vk::PipelineLayoutCreateInfo{
+			.setLayoutCount = 1,
+			.pSetLayouts = &rawLayout,
+		} };
+
+		const std::vector<std::uint32_t> code = readSpirv("shaders/gradient.spv");
+
+		const vk::raii::ShaderModule module{ device.get(), vk::ShaderModuleCreateInfo{
+			.codeSize = code.size() * sizeof(std::uint32_t),
+			.pCode = code.data(),
+		} };
+
+		pipeline = vk::raii::Pipeline{ device.get(), nullptr, vk::ComputePipelineCreateInfo{
+			.stage = vk::PipelineShaderStageCreateInfo{
+				.stage = vk::ShaderStageFlagBits::eCompute,
+				.module = *module,
+				// Must match the name in the SPIR-V, which slangc kept
+				// because of -fvk-use-entrypoint-name.
+				.pName = "computeMain",
+			},
+			.layout = *pipelineLayout,
+		} };
+	}
+
+	GradientPipeline(const GradientPipeline&) = delete;
+	GradientPipeline& operator=(const GradientPipeline&) = delete;
+	GradientPipeline(GradientPipeline&&) = delete;
+	GradientPipeline& operator=(GradientPipeline&&) = delete;
+
+	const vk::raii::Pipeline& get() const noexcept { return pipeline; }
+	const vk::raii::PipelineLayout& getLayout() const noexcept { return pipelineLayout; }
+	vk::DescriptorSet getSet() const noexcept { return *sets.front(); }
+};
+
 // One frame: wait for this frame's fence, acquire an image, clear it, present.
 // No pipeline is involved - the clear is a transfer operation, and the only
 // real work is moving the image between layouts.
@@ -529,6 +699,8 @@ private:
 
 	const Device& device;
 	const Swapchain& swapchain;
+	const StorageImage& storageImage;
+	const GradientPipeline& gradient;
 
 	vk::raii::CommandPool pool{ nullptr };
 	std::vector<vk::raii::CommandBuffer> commandBuffers;
@@ -551,47 +723,97 @@ private:
 		.layerCount = 1,
 	};
 
-	void record(const vk::raii::CommandBuffer& cmd, vk::Image image) const {
+	static vk::ImageMemoryBarrier2 barrier(
+		vk::Image image,
+		vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess, vk::ImageLayout oldLayout,
+		vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess, vk::ImageLayout newLayout) {
+
+		return vk::ImageMemoryBarrier2{
+			.srcStageMask = srcStage,
+			.srcAccessMask = srcAccess,
+			.dstStageMask = dstStage,
+			.dstAccessMask = dstAccess,
+			.oldLayout = oldLayout,
+			.newLayout = newLayout,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = image,
+			.subresourceRange = COLOR_RANGE,
+		};
+	}
+
+	void record(const vk::raii::CommandBuffer& cmd, vk::Image swapImage) const {
 		cmd.reset();
 		cmd.begin(vk::CommandBufferBeginInfo{
 			.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
 		});
 
-		const vk::ImageMemoryBarrier2 toTransferDst{
-			.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-			.srcAccessMask = {},
-			.dstStageMask = vk::PipelineStageFlagBits2::eClear,
-			.dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-			// Undefined: we overwrite every pixel, so the old contents are
-			// not worth preserving.
-			.oldLayout = vk::ImageLayout::eUndefined,
-			.newLayout = vk::ImageLayout::eTransferDstOptimal,
-			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image = image,
-			.subresourceRange = COLOR_RANGE,
-		};
+		const vk::Image target = storageImage.get();
+		const vk::Extent2D size = storageImage.getExtent();
+
+		// eUndefined every frame: the shader writes every pixel, so last
+		// frame's contents are not worth preserving. That changes at Phase 6,
+		// where accumulation reads the previous result back.
+		const vk::ImageMemoryBarrier2 toGeneral = barrier(target,
+			vk::PipelineStageFlagBits2::eAllCommands, {}, vk::ImageLayout::eUndefined,
+			vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+			vk::ImageLayout::eGeneral);
 
 		cmd.pipelineBarrier2(vk::DependencyInfo{
 			.imageMemoryBarrierCount = 1,
-			.pImageMemoryBarriers = &toTransferDst,
+			.pImageMemoryBarriers = &toGeneral,
 		});
 
-		const vk::ClearColorValue clearColor{ 0.10f, 0.10f, 0.16f, 1.0f };
-		cmd.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, clearColor, COLOR_RANGE);
+		cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *gradient.get());
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *gradient.getLayout(),
+			0, gradient.getSet(), nullptr);
 
-		const vk::ImageMemoryBarrier2 toPresent{
-			.srcStageMask = vk::PipelineStageFlagBits2::eClear,
-			.srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-			.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-			.dstAccessMask = {},
-			.oldLayout = vk::ImageLayout::eTransferDstOptimal,
-			.newLayout = vk::ImageLayout::ePresentSrcKHR,
-			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image = image,
-			.subresourceRange = COLOR_RANGE,
+		// Rounded up: the shader discards threads past the edge.
+		cmd.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+
+		const std::array<vk::ImageMemoryBarrier2, 2> beforeBlit{
+			barrier(target,
+				vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+				vk::ImageLayout::eGeneral,
+				vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead,
+				vk::ImageLayout::eTransferSrcOptimal),
+			barrier(swapImage,
+				vk::PipelineStageFlagBits2::eAllCommands, {}, vk::ImageLayout::eUndefined,
+				vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite,
+				vk::ImageLayout::eTransferDstOptimal),
 		};
+
+		cmd.pipelineBarrier2(vk::DependencyInfo{
+			.imageMemoryBarrierCount = static_cast<std::uint32_t>(beforeBlit.size()),
+			.pImageMemoryBarriers = beforeBlit.data(),
+		});
+
+		const vk::ImageSubresourceLayers layers{
+			.aspectMask = vk::ImageAspectFlagBits::eColor,
+			.mipLevel = 0,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		};
+
+		vk::ImageBlit region{};
+		region.srcSubresource = layers;
+		region.srcOffsets[0] = vk::Offset3D{ 0, 0, 0 };
+		region.srcOffsets[1] = vk::Offset3D{ static_cast<std::int32_t>(size.width),
+			static_cast<std::int32_t>(size.height), 1 };
+		region.dstSubresource = layers;
+		region.dstOffsets[0] = vk::Offset3D{ 0, 0, 0 };
+		region.dstOffsets[1] = vk::Offset3D{ static_cast<std::int32_t>(swapchain.getExtent().width),
+			static_cast<std::int32_t>(swapchain.getExtent().height), 1 };
+
+		// The blit also converts R32G32B32A32_SFLOAT down to the swapchain's
+		// B8G8R8A8_UNORM. Nearest because the extents match exactly.
+		cmd.blitImage(target, vk::ImageLayout::eTransferSrcOptimal,
+			swapImage, vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+
+		const vk::ImageMemoryBarrier2 toPresent = barrier(swapImage,
+			vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite,
+			vk::ImageLayout::eTransferDstOptimal,
+			vk::PipelineStageFlagBits2::eAllCommands, {}, vk::ImageLayout::ePresentSrcKHR);
 
 		cmd.pipelineBarrier2(vk::DependencyInfo{
 			.imageMemoryBarrierCount = 1,
@@ -602,7 +824,8 @@ private:
 	}
 
 public:
-	Renderer(const Device& dev, const Swapchain& swap) :device(dev), swapchain(swap) {
+	Renderer(const Device& dev, const Swapchain& swap, const StorageImage& target, const GradientPipeline& grad)
+		:device(dev), swapchain(swap), storageImage(target), gradient(grad) {
 		pool = vk::raii::CommandPool{ device.get(), vk::CommandPoolCreateInfo{
 			.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
 			.queueFamilyIndex = device.getQueueFamily(),
@@ -660,7 +883,7 @@ public:
 		const vk::SemaphoreSubmitInfo waitInfo{
 			.semaphore = *imageAvailable[frame],
 			.value = 0,
-			.stageMask = vk::PipelineStageFlagBits2::eClear,
+			.stageMask = vk::PipelineStageFlagBits2::eComputeShader,
 			.deviceIndex = 0,
 		};
 
@@ -718,6 +941,11 @@ private:
 	Device device;
 	// Last: destroyed first, before both the device and the surface.
 	Swapchain swapchain;
+	// After the device: frees its allocations through it.
+	Allocator allocator;
+	// Sized to the swapchain, so after it; destroyed before the allocator.
+	StorageImage storageImage;
+	GradientPipeline gradient;
 	// After the swapchain: its semaphores are sized from the image count.
 	Renderer renderer;
 public:
@@ -726,7 +954,10 @@ public:
 		surface(instance, window),
 		device(instance),
 		swapchain(device, surface, window),
-		renderer(device, swapchain) {
+		allocator(instance.get(), device.getPhysical(), device.get()),
+		storageImage(device, allocator, swapchain.getExtent()),
+		gradient(device, storageImage),
+		renderer(device, swapchain, storageImage, gradient) {
 
 	}
 
